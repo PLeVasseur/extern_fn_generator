@@ -2,9 +2,11 @@ extern crate proc_macro;
 
 use proc_macro::TokenStream;
 use quote::{quote, format_ident};
-use syn::{parse_macro_input, ItemStruct, ItemImpl, Lit, ImplItem, ItemFn, Token, Fields};
+use syn::{parse_macro_input, ItemStruct, ItemImpl, Lit, ImplItem, ItemFn, Token, Fields, visit_mut, LitInt};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
+use syn::visit_mut::VisitMut;
+use syn::visit_mut::visit_item_impl_mut;
 
 #[proc_macro_attribute]
 pub fn generate_extern_fn_simple(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -44,6 +46,19 @@ impl Parse for Args {
             }
         }).collect();
         Ok(Args(strings))
+    }
+}
+
+struct StructNameRewriter {
+    old_name: String,
+    new_name: String,
+}
+
+impl VisitMut for StructNameRewriter {
+    fn visit_ident_mut(&mut self, i: &mut syn::Ident) {
+        if i == self.old_name.as_str() {
+            *i = syn::Ident::new(&self.new_name, i.span());
+        }
     }
 }
 
@@ -164,15 +179,26 @@ pub fn generate_struct_impl(args: TokenStream, input: TokenStream) -> TokenStrea
     let Args(args) = parse_macro_input!(args as Args);
 
     let self_ty = &input_impl.self_ty;
+
     let mut generated_impls = quote! {};
 
     for arg in args {
         let ident_str = format!("{}_{}", quote!(#self_ty).to_string().replace(" ", ""), arg);
         let ident = format_ident!("{}", ident_str);
-        let items = &input_impl.items;
+
+        let mut new_impl = input_impl.clone();
+        let mut rewriter = StructNameRewriter {
+            old_name: quote!(#self_ty).to_string(),
+            new_name: ident.to_string(),
+        };
+
+        visit_item_impl_mut(&mut rewriter, &mut new_impl);
+
+        let new_impl_items = &new_impl.items;
+
         generated_impls.extend(quote! {
             impl #ident {
-                #(#items)*
+                #(#new_impl_items)*
             }
         });
     }
@@ -199,7 +225,7 @@ pub fn generate_extern_fn(args: TokenStream, input: TokenStream) -> TokenStream 
         let extern_fn_name = format_ident!("extern_{}_on_msg", struct_name);
 
         for item in &input_impl.items {
-            if let syn::ImplItem::Fn(method) = item {
+            if let ImplItem::Fn(method) = item {
                 if method.sig.ident == "on_msg" {
                     generated_fns.extend(quote! {
                         #[no_mangle]
@@ -229,4 +255,40 @@ pub fn generate_extern_fn(args: TokenStream, input: TokenStream) -> TokenStream 
     };
 
     TokenStream::from(expanded)
+}
+
+#[proc_macro]
+pub fn generate_extern_fns(input: TokenStream) -> TokenStream {
+    let num_fns = syn::parse_macro_input!(input as LitInt).base10_parse::<usize>().unwrap();
+
+    let mut generated_fns = quote! {};
+
+    for i in 0..num_fns {
+        let extern_fn_name = format_ident!("extern_on_msg_wrapper_{}", i);
+        let fn_name = format_ident!("on_msg_wrapper_{}", i);
+
+        let fn_code = quote! {
+            #[no_mangle]
+            pub extern "C" fn #extern_fn_name(param: u32) {
+                println!("Calling extern function #{}", #i);
+                let registry = LISTENER_REGISTRY.lock().unwrap();
+                if let Some(listener) = registry.get(&#i) {
+                    let listener = Arc::clone(listener);
+                    tokio::spawn(async move {
+                        #fn_name(listener, param).await;
+                    });
+                } else {
+                    println!("Listener not found for ID {}", #i);
+                }
+            }
+
+            async fn #fn_name(listener: Arc<dyn UListener>, param: u32) {
+                listener.on_msg(param).await;
+            }
+        };
+
+        generated_fns.extend(fn_code);
+    }
+
+    generated_fns.into()
 }
